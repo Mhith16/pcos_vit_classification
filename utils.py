@@ -69,7 +69,7 @@ def get_transforms():
     return train_transform, val_transform
 
 def get_data_loaders(data_path, batch_size=16, val_split=0.2):
-    """Create train and validation data loaders"""
+    """Create train and validation data loaders - OPTIMIZED"""
     train_transform, val_transform = get_transforms()
     
     # Create full dataset
@@ -87,8 +87,23 @@ def get_data_loaders(data_path, batch_size=16, val_split=0.2):
     # Apply different transforms to validation set
     val_dataset.dataset.transform = val_transform
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    # OPTIMIZED DATA LOADERS
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4,  # Faster data loading
+        pin_memory=True,  # Faster GPU transfer
+        persistent_workers=True  # Keep workers alive
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
     return train_loader, val_loader
 

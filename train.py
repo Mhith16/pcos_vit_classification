@@ -10,31 +10,47 @@ from models import get_model
 from utils import (get_data_loaders, calculate_metrics, plot_training_history, 
                    plot_confusion_matrix, save_results, EarlyStopping)
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    """Train for one epoch"""
+def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None):
+    """Train for one epoch - WITH MIXED PRECISION"""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
     
     for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc="Training")):
-        data, target = data.to(device), target.to(device)
+        data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
         
         optimizer.zero_grad()
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        optimizer.step()
+        
+        if Config.USE_MIXED_PRECISION and scaler is not None:
+            # Mixed precision training
+            with torch.cuda.amp.autocast():
+                output = model(data)
+                loss = criterion(output, target)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Regular training
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
         
         total_loss += loss.item()
         pred = output.argmax(dim=1)
         correct += pred.eq(target).sum().item()
         total += target.size(0)
+        
+        # Print progress every 50 batches
+        if batch_idx % 50 == 0:
+            print(f'Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}')
     
     return total_loss / len(train_loader), correct / total
 
 def validate_epoch(model, val_loader, criterion, device):
-    """Validate for one epoch"""
+    """Validate for one epoch - OPTIMIZED"""
     model.eval()
     total_loss = 0
     all_preds = []
@@ -43,9 +59,15 @@ def validate_epoch(model, val_loader, criterion, device):
     
     with torch.no_grad():
         for data, target in tqdm(val_loader, desc="Validating"):
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            loss = criterion(output, target)
+            data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
+            
+            if Config.USE_MIXED_PRECISION:
+                with torch.cuda.amp.autocast():
+                    output = model(data)
+                    loss = criterion(output, target)
+            else:
+                output = model(data)
+                loss = criterion(output, target)
             
             total_loss += loss.item()
             pred = output.argmax(dim=1)
@@ -61,7 +83,7 @@ def validate_epoch(model, val_loader, criterion, device):
     return avg_loss, metrics, all_labels, all_preds, all_probs
 
 def train_model(model_type):
-    """Train a specific model"""
+    """Train a specific model - OPTIMIZED FOR T4"""
     print(f"\n{'='*50}")
     print(f"Training {model_type.upper()}")
     print(f"{'='*50}")
@@ -69,6 +91,10 @@ def train_model(model_type):
     # Initialize model
     model = get_model(model_type, Config.NUM_CLASSES)
     model = model.to(Config.DEVICE)
+    
+    # Enable gradient checkpointing for memory efficiency
+    if Config.USE_GRADIENT_CHECKPOINTING and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
     
     # Get data loaders
     train_loader, val_loader = get_data_loaders(
@@ -82,6 +108,9 @@ def train_model(model_type):
     optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_EPOCHS)
     
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler() if Config.USE_MIXED_PRECISION else None
+    
     # Early stopping
     early_stopping = EarlyStopping(patience=Config.EARLY_STOPPING_PATIENCE)
     
@@ -92,13 +121,15 @@ def train_model(model_type):
     
     print(f"Dataset size: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val")
     print(f"Device: {Config.DEVICE}")
+    print(f"Mixed Precision: {Config.USE_MIXED_PRECISION}")
+    print(f"Batch Size: {Config.BATCH_SIZE}")
     
     for epoch in range(Config.NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{Config.NUM_EPOCHS}")
         print("-" * 30)
         
         # Train
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, Config.DEVICE)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, Config.DEVICE, scaler)
         
         # Validate
         val_loss, metrics, val_labels, val_preds, val_probs = validate_epoch(
@@ -162,6 +193,65 @@ def train_model(model_type):
     results = {
         'model_type': model_type,
         'final_metrics': final_metrics,
+        'training_history': {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_accs': train_accs,
+            'val_accs': val_accs
+        },
+        'best_epoch': checkpoint['epoch']
+    }
+    
+    save_results(results, model_type, Config.RESULTS_SAVE_PATH)
+    
+    return final_metrics
+
+def main():
+    """Main training function"""
+    print("PCOS Classification Training - OPTIMIZED FOR T4")
+    print(f"Device: {Config.DEVICE}")
+    print(f"Mixed Precision: {Config.USE_MIXED_PRECISION}")
+    
+    # Clear GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Train all models
+    all_results = {}
+    
+    for model_type in Config.MODELS_TO_TRAIN:
+        try:
+            metrics = train_model(model_type)
+            all_results[model_type] = metrics
+            
+            # Clear GPU cache between models
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Error training {model_type}: {str(e)}")
+            continue
+    
+    # Compare all models
+    print(f"\n{'='*50}")
+    print("MODEL COMPARISON")
+    print(f"{'='*50}")
+    
+    if all_results:
+        import pandas as pd
+        df = pd.DataFrame(all_results).T
+        print(df.round(4))
+        
+        # Save comparison
+        os.makedirs(Config.RESULTS_SAVE_PATH, exist_ok=True)
+        df.to_csv(os.path.join(Config.RESULTS_SAVE_PATH, 'model_comparison.csv'))
+        
+        # Find best model
+        best_model = max(all_results.keys(), key=lambda x: all_results[x]['auc_roc'])
+        print(f"\nBest Model: {best_model} (AUC-ROC: {all_results[best_model]['auc_roc']:.4f})")
+
+if __name__ == "__main__":
+    main()
         'training_history': {
             'train_losses': train_losses,
             'val_losses': val_losses,
